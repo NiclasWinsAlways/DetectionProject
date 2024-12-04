@@ -92,24 +92,19 @@ void connectToMQTT() {
   }
 }
 
-
-
-
-
 void publishToMQTT(int people, float frequency) {
   unsigned long now = millis();
   if (mqttClient.connected() && (now - lastPublishTime >= publishInterval)) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
+      // Format the timestamp
       char timeString[64];
       strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
-      // Create payload with timestamp
-      String payload = "{\"peopleCount\":" + String(people) +
+      // Construct payload with timestamp
+      String payload = String("{\"peopleCount\":") + String(people) +
                        ",\"motionFrequency\":" + String(frequency, 2) +
-                       ",\"totalMotions\":" + String(totalMotions) +
-                       ",\"lastMotionTime\":" + String(lastMotionTime / 1000) +
-                       ",\"timestamp\":\"" + String(timeString) + "\"}";
+                       ",\"timestamp\":\"" + timeString + "\"}";
 
       // Debug the payload before publishing
       Serial.println("Payload before publish: " + payload);
@@ -305,88 +300,72 @@ void setup() {
 
 
 void loop() {
-mqttClient.loop(); // Ensure MQTT library handles connection
+    mqttClient.loop(); // Ensure MQTT library handles connection
     server.handleClient(); // Handle HTTP requests
     ensureMQTTConnection();
 
+    int rawState = digitalRead(SENSOR_PIN);
 
-  int rawState = digitalRead(SENSOR_PIN);
+    // Debounce logic
+    if (rawState != currentDebouncedState) {
+        if (millis() - lastDebounceTime > debounceDelay) {
+            currentDebouncedState = rawState;
+            lastDebounceTime = millis();
 
-  // Debounce logic
-  if (rawState != currentDebouncedState) {
-    if (millis() - lastDebounceTime > debounceDelay) {
-      currentDebouncedState = rawState;
-      lastDebounceTime = millis();
+            if (currentDebouncedState == LOW) { // Motion detected
+                motionActive = true;
+                lastMotionTime = millis();
+                motionCount++;
+                peopleCount++;
 
-      if (currentDebouncedState == LOW) {
-        motionActive = true;
-        lastMotionTime = millis();
-        motionCount++;
-        peopleCount++;
+                // Log individual motion event
+                float frequency = (float)motionCount / ((millis() - startTime) / 60000.0);
+                logDataToCSV(peopleCount, frequency); // Log motion immediately
 
-        // Log individual motion event
-        float frequency = (float)motionCount / ((millis() - startTime) / 60000.0);
-        logDataToCSV(peopleCount, frequency); // Log motion immediately
+                // Use the publishToMQTT function to publish data
+                publishToMQTT(peopleCount, frequency);
 
-        // Publish motion data to MQTT
-        if (mqttClient.connected()) {
-          if (mqttClient.publish(mqttTopic, ("{\"peopleCount\":" + String(peopleCount) + ",\"motionFrequency\":" + String(frequency, 2) + "}").c_str())) {
-            Serial.println("Motion data published to MQTT.");
-          } else {
-            Serial.println("Failed to publish to MQTT. Publish method failed.");
-          }
-        } else {
-          Serial.println("Failed to publish to MQTT. Broker not connected.");
+                Serial.println("Motion detected and logged.");
+                Serial.print("Current total: ");
+                Serial.println(peopleCount);
+            }
+
+            if (currentDebouncedState == HIGH && motionActive) {
+                motionActive = false;
+            }
         }
+    }
 
-        Serial.println("Motion detected and logged.");
-        Serial.print("Current total: ");
+    unsigned long currentTime = millis();
+
+    // Periodic log every 10 seconds
+    if (currentTime - lastLogTime >= logInterval) {
+        float frequency = (float)motionCount / ((currentTime - startTime) / 60000.0);
+        logDataToCSV(peopleCount, frequency); // Periodic log for summary
+
+        // Use the publishToMQTT function for periodic log
+        publishToMQTT(peopleCount, frequency);
+
+        totalMotions += motionCount;
+        intervals++;
+        motionCount = 0; // Reset after logging
+        lastLogTime = currentTime; // Update log timer
+    }
+
+    // Go to sleep after 1 minute of no motion
+    if (currentTime - lastMotionTime >= sleepInterval) {
+        Serial.println("No motion for 1 minute. Going to sleep...");
+        Serial.print("Total people counted: ");
         Serial.println(peopleCount);
-      }
 
-      if (currentDebouncedState == HIGH && motionActive) {
-        motionActive = false;
-      }
-    }
-  }
-
-  unsigned long currentTime = millis();
-
-  // Periodic log every 10 seconds
-  if (currentTime - lastLogTime >= logInterval) {
-    float frequency = (float)motionCount / ((currentTime - startTime) / 60000.0);
-    logDataToCSV(peopleCount, frequency); // Periodic log for summary
-
-    // Publish periodic log to MQTT
-    if (mqttClient.connected()) {
-      if (mqttClient.publish(mqttTopic, ("{\"peopleCount\":" + String(peopleCount) + ",\"motionFrequency\":" + String(frequency, 2) + "}").c_str())) {
-        Serial.println("Periodic data published to MQTT.");
-      } else {
-        Serial.println("Failed to publish periodic data to MQTT. Publish method failed.");
-      }
-    } else {
-      Serial.println("Failed to publish periodic data to MQTT. Broker not connected.");
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, LOW); // Enable GPIO wake-up
+        delay(100);
+        esp_deep_sleep_start();
     }
 
-    totalMotions += motionCount;
-    intervals++;
-    motionCount = 0; // Reset after logging
-    lastLogTime = currentTime; // Update log timer
-  }
-
-  // Go to sleep after 1 minute of no motion
-  if (currentTime - lastMotionTime >= sleepInterval) {
-    Serial.println("No motion for 1 minute. Going to sleep...");
-    Serial.print("Total people counted: ");
-    Serial.println(peopleCount);
-
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, LOW); // Enable GPIO wake-up
-    delay(100);
-    esp_deep_sleep_start();
-  }
-
-  delay(50);
+    delay(50);
 }
+
 
 
 
