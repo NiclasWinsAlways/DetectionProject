@@ -4,6 +4,8 @@
 #include <SPIFFS.h>
 #include <WebServer.h>
 #include "esp_sleep.h"
+#include <PubSubClient.h>
+
 
 // Wi-Fi credentials
 const char* ssid = "E308";
@@ -30,12 +32,104 @@ unsigned long lastLogTime = 0;                 // Tracks the last time data was 
 const unsigned long logInterval = 10000;      // Log data every 10 seconds
 const unsigned long sleepInterval = 60000;    // Sleep after 1 minute of no motion
 const unsigned long debounceDelay = 200; // Debounce time (ms)
+unsigned long lastReconnectAttempt = 0; // Tracks the last reconnection attempt time
+const unsigned long reconnectInterval = 60000; // 1 minute interval (in milliseconds)
+unsigned long lastPublishTime = 0;
+const unsigned long publishInterval = 1000; // Publish at most once per second  
+
+
 
 
 unsigned long lastDebounceTime = 0; 
 int previousState = HIGH; 
 int currentDebouncedState = HIGH; 
 bool motionActive = false;
+// Tracks the MQTT connection state
+bool mqttConnected = false; 
+
+
+// MQTT broker details
+const char* mqttServer = "test.mosquitto.org"; // Public test broker
+const int mqttPort = 1883;
+const char* mqttTopic = "motion/data";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+// Add the function prototype
+void connectToMQTT();
+
+void ensureMQTTConnection() {
+    if (!mqttClient.connected()) {
+        Serial.print("Reconnecting to MQTT... ");
+        String clientID = "ESP32Client-" + String(random(0xffff), HEX); // Unique client ID
+        if (mqttClient.connect(clientID.c_str())) {
+            Serial.println("Reconnected to MQTT broker!");
+            mqttConnected = true;
+        } else {
+            Serial.print("Failed to reconnect. State: ");
+            Serial.println(mqttClient.state());
+            mqttConnected = false;
+        }
+    }
+    mqttClient.loop(); // Ensure MQTT connection remains alive
+}
+
+
+void connectToMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort); // Set MQTT broker and port
+  mqttClient.setKeepAlive(60);                // Set keep-alive interval to 60 seconds
+
+  Serial.print("Connecting to MQTT broker...");
+  if (mqttClient.connect("ESP32Client")) {    // Use a unique client ID
+    Serial.println("Connected to MQTT broker!");
+      delay(1000); // Allow time for stabilization
+                           
+    mqttConnected = true;                     // Update the connection state
+  } else {
+    Serial.print("Failed to connect. MQTT state: ");
+    Serial.println(mqttClient.state());
+    mqttConnected = false;
+  }
+}
+
+
+
+
+
+void publishToMQTT(int people, float frequency) {
+  unsigned long now = millis();
+  if (mqttClient.connected() && (now - lastPublishTime >= publishInterval)) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeString[64];
+      strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+      // Create payload with timestamp
+      String payload = "{\"peopleCount\":" + String(people) +
+                       ",\"motionFrequency\":" + String(frequency, 2) +
+                       ",\"totalMotions\":" + String(totalMotions) +
+                       ",\"lastMotionTime\":" + String(lastMotionTime / 1000) +
+                       ",\"timestamp\":\"" + String(timeString) + "\"}";
+
+      // Debug the payload before publishing
+      Serial.println("Payload before publish: " + payload);
+
+      // Publish the payload
+      if (mqttClient.publish(mqttTopic, payload.c_str())) {
+        Serial.println("Data published to MQTT: " + payload);
+        lastPublishTime = now;
+      } else {
+        Serial.println("Failed to publish to MQTT. Publish method failed.");
+      }
+    } else {
+      Serial.println("Failed to get current time for MQTT payload.");
+    }
+  } else if (!mqttClient.connected()) {
+    Serial.println("Failed to publish to MQTT. Broker not connected.");
+  }
+}
+
+
 
 // Log data to CSV
 void logDataToCSV(int people, float frequency, const char* eventType = "Motion") {
@@ -186,6 +280,16 @@ void setup() {
   // Configure NTP
   configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
 
+  // Set up MQTT
+  mqttClient.setServer(mqttServer, mqttPort);
+  Serial.print("Connecting to MQTT broker...");
+  if (mqttClient.connect("ESP32Client")) { // Use a unique client ID
+    Serial.println("Connected to MQTT broker!");
+  } else {
+    Serial.print("Failed to connect. MQTT state: ");
+    Serial.println(mqttClient.state()); // Print the MQTT state
+  }
+
   // Set up the web server
   server.on("/", handleRoot); // Serve the webpage
   server.on("/data", handleData); // Serve motion data as JSON
@@ -198,8 +302,13 @@ void setup() {
   startTime = millis();
 }
 
+
+
 void loop() {
-  server.handleClient(); // Handle HTTP requests
+mqttClient.loop(); // Ensure MQTT library handles connection
+    server.handleClient(); // Handle HTTP requests
+    ensureMQTTConnection();
+
 
   int rawState = digitalRead(SENSOR_PIN);
 
@@ -219,6 +328,17 @@ void loop() {
         float frequency = (float)motionCount / ((millis() - startTime) / 60000.0);
         logDataToCSV(peopleCount, frequency); // Log motion immediately
 
+        // Publish motion data to MQTT
+        if (mqttClient.connected()) {
+          if (mqttClient.publish(mqttTopic, ("{\"peopleCount\":" + String(peopleCount) + ",\"motionFrequency\":" + String(frequency, 2) + "}").c_str())) {
+            Serial.println("Motion data published to MQTT.");
+          } else {
+            Serial.println("Failed to publish to MQTT. Publish method failed.");
+          }
+        } else {
+          Serial.println("Failed to publish to MQTT. Broker not connected.");
+        }
+
         Serial.println("Motion detected and logged.");
         Serial.print("Current total: ");
         Serial.println(peopleCount);
@@ -237,9 +357,20 @@ void loop() {
     float frequency = (float)motionCount / ((currentTime - startTime) / 60000.0);
     logDataToCSV(peopleCount, frequency); // Periodic log for summary
 
+    // Publish periodic log to MQTT
+    if (mqttClient.connected()) {
+      if (mqttClient.publish(mqttTopic, ("{\"peopleCount\":" + String(peopleCount) + ",\"motionFrequency\":" + String(frequency, 2) + "}").c_str())) {
+        Serial.println("Periodic data published to MQTT.");
+      } else {
+        Serial.println("Failed to publish periodic data to MQTT. Publish method failed.");
+      }
+    } else {
+      Serial.println("Failed to publish periodic data to MQTT. Broker not connected.");
+    }
+
     totalMotions += motionCount;
     intervals++;
-    motionCount = 0;  // Reset after logging
+    motionCount = 0; // Reset after logging
     lastLogTime = currentTime; // Update log timer
   }
 
@@ -256,4 +387,11 @@ void loop() {
 
   delay(50);
 }
+
+
+
+
+
+
+
 
