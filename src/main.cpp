@@ -55,8 +55,6 @@ bool motionActive = false;                     // Indicates if motion is activel
 // Tracks the connection state with the MQTT broker
 bool mqttConnected = false;                    // True if connected to the MQTT broker
 
-
-
 // MQTT broker details
 const char* mqttServer = "test.mosquitto.org"; // Public test broker
 const int mqttPort = 1883; // Public Test pORT
@@ -82,7 +80,6 @@ void ensureMQTTConnection() {
     }
     mqttClient.loop(); // Ensure MQTT connection remains alive
 }
-
 
 void connectToMQTT() {
   mqttClient.setServer(mqttServer, mqttPort); // Set MQTT broker and port
