@@ -6,7 +6,9 @@
 #include "esp_sleep.h"
 #include <PubSubClient.h>
 
-
+//use this in a cmd
+//for better security make a more secure topic name and not motion/data not very secure can easily be posted to
+// mosquitto_sub -h test.mosquitto.org -p 1883 -t "motion/data" -v
 // Wi-Fi credentials
 const char* ssid = "E308";
 const char* password = "98806829";
@@ -17,41 +19,48 @@ const char* password = "98806829";
 // Web server on port 80
 WebServer server(80);
 
-// Variables saved during deep sleep
-RTC_DATA_ATTR unsigned long lastMotionTime = 0; 
-RTC_DATA_ATTR int motionCount = 0; 
-RTC_DATA_ATTR int peopleCount = 0; 
-RTC_DATA_ATTR unsigned long startTime = 0; 
+// ======== VARIABLES ========
 
-// Additional tracking variables
-static int totalMotions = 0; 
-static int intervals = 0; 
+// ======== DEEP SLEEP VARIABLES ========
+// Variables retained during deep sleep to preserve state across wake-ups
+RTC_DATA_ATTR unsigned long lastMotionTime = 0; // Time of the last motion event
+RTC_DATA_ATTR int motionCount = 0;             // Number of motion events since last wake-up
+RTC_DATA_ATTR int peopleCount = 0;             // Total people counted since start
+RTC_DATA_ATTR unsigned long startTime = 0;     // Time when the device started or woke up
 
-// Timers
+// ======== MOTION TRACKING ========
+// Variables used to track motion activity and statistics
+static int totalMotions = 0;                   // Total motions detected across all sessions
+static int intervals = 0;                      // Count of logging intervals (e.g., every 10 seconds)
+
+// ======== TIMERS ========
+// Timing variables for periodic tasks and debounce logic
 unsigned long lastLogTime = 0;                 // Tracks the last time data was logged
-const unsigned long logInterval = 10000;      // Log data every 10 seconds
-const unsigned long sleepInterval = 60000;    // Sleep after 1 minute of no motion
-const unsigned long debounceDelay = 200; // Debounce time (ms)
-unsigned long lastReconnectAttempt = 0; // Tracks the last reconnection attempt time
-const unsigned long reconnectInterval = 60000; // 1 minute interval (in milliseconds)
-unsigned long lastPublishTime = 0;
-const unsigned long publishInterval = 1000; // Publish at most once per second  
+const unsigned long logInterval = 10000;       // Interval for periodic logging (10 seconds)
+const unsigned long sleepInterval = 60000;     // Time of inactivity before going to sleep (1 minute)
+const unsigned long debounceDelay = 200;       // Debounce time to filter out false motion triggers (200 ms)
+unsigned long lastReconnectAttempt = 0;        // Time of the last MQTT reconnection attempt
+const unsigned long reconnectInterval = 60000; // Interval for MQTT reconnection attempts (1 minute)
+unsigned long lastPublishTime = 0;             // Tracks the last time data was published to MQTT
+const unsigned long publishInterval = 1000;    // Interval for publishing MQTT messages (1 second)
+unsigned long lastDebounceTime = 0;            // Tracks the last time the sensor input was debounced
 
+// ======== SENSOR STATE ========
+// Variables for sensor input and motion activity state
+int previousState = HIGH;                      // Previous state of the motion sensor (HIGH = no motion)
+int currentDebouncedState = HIGH;              // Current debounced state of the sensor
+bool motionActive = false;                     // Indicates if motion is actively detected
 
+// ======== MQTT CONNECTION STATE ========
+// Tracks the connection state with the MQTT broker
+bool mqttConnected = false;                    // True if connected to the MQTT broker
 
-
-unsigned long lastDebounceTime = 0; 
-int previousState = HIGH; 
-int currentDebouncedState = HIGH; 
-bool motionActive = false;
-// Tracks the MQTT connection state
-bool mqttConnected = false; 
 
 
 // MQTT broker details
 const char* mqttServer = "test.mosquitto.org"; // Public test broker
-const int mqttPort = 1883;
-const char* mqttTopic = "motion/data";
+const int mqttPort = 1883; // Public Test pORT
+const char* mqttTopic = "motion/data"; // Public test Topic
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -126,28 +135,40 @@ void publishToMQTT(int people, float frequency) {
 
 
 
-// Log data to CSV
+// ======== LOG DATA TO CSV ========
+// Logs motion data to a CSV file in SPIFFS
+// Each log includes a timestamp, people count, frequency, and event type
 void logDataToCSV(int people, float frequency, const char* eventType = "Motion") {
+  // Open the CSV file in append mode
   File file = SPIFFS.open("/data.csv", FILE_APPEND);
   if (!file) {
+    // Error if file cannot be opened for writing
     Serial.println("Failed to open file for appending");
     return;
   }
 
+  // Get the current time for the log entry
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
+    // Format the timestamp as "YYYY-MM-DD HH:MM:SS"
     char timeString[64];
     strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
-    // Log with EventType
+    // Append the data to the CSV file with the given format
     file.printf("%-20s %-10d %-10.2f %-10s\n", timeString, people, frequency, eventType);
 
+    // Debug: Print the logged data to the serial monitor
     Serial.printf("Data logged: %-20s %-10d %-10.2f %-10s\n", timeString, people, frequency, eventType);
   } else {
+    // Error if the time could not be retrieved
     Serial.println("Failed to get current time for CSV logging");
   }
+
+  // Close the file after writing
   file.close();
 }
+// ======== END OF LOG DATA TO CSV ========
+
 
 
 
@@ -189,28 +210,38 @@ void handleData() {
   server.send(200, "application/json", json);
 }
 
-// Serve the CSV file for download
+// ======== HANDLE CSV DOWNLOAD AND CLEAR ========
+// This function serves the CSV file to the client for download
+// and then clears its contents, reinitializing with headers.
 void handleDownloadCSV() {
+  // Open the CSV file in read mode
   File file = SPIFFS.open("/data.csv", "r");
   if (!file) {
+    // Error if file cannot be opened
     server.send(500, "text/plain", "Failed to open file");
     return;
   }
 
-  // Serve the file for download
+  // Serve the file to the client for download
   server.streamFile(file, "text/csv");
-  file.close();
+  file.close(); // Close the file after serving
 
-  // Clear the file immediately after serving
-  file = SPIFFS.open("/data.csv", FILE_WRITE); // Open in write mode to overwrite
+  // Open the CSV file in write mode to clear it
+  file = SPIFFS.open("/data.csv", FILE_WRITE);
   if (file) {
-    file.println("Timestamp,PeopleCount,MotionFrequency,EventType"); // Reinitialize with headers
+    // Write back the headers to keep the CSV structure intact
+    file.println("Timestamp,PeopleCount,MotionFrequency,EventType");
     file.close();
-    Serial.println("CSV file cleared after download.");
+    Serial.println("CSV file cleared after download."); // Debug message
   } else {
+    // Error if the file cannot be cleared
     Serial.println("Failed to clear the CSV file.");
   }
+
+  // Inform the client that the CSV was downloaded and cleared
+  server.send(200, "text/plain", "CSV downloaded and cleared.");
 }
+// ======== END OF CSV DOWNLOAD AND CLEAR ========
 
 
 
@@ -232,139 +263,142 @@ void handleSSE() {
   server.sendContent("data: " + json + "\n\n");
 }
 
+// ======== SETUP FUNCTION ========
+// Runs once at startup or after a wake-up event
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    // ======== SERIAL COMMUNICATION ========
+    Serial.begin(115200); // Start serial communication
+    delay(1000); // Short delay for initialization
 
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.println("Woke up due to motion detected!");
-    lastMotionTime = millis(); // Reset motion time after wake-up
-  } else {
-    Serial.println("Power on or other wake-up cause");
-  }
-
-  // Initialize SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("An error occurred while mounting SPIFFS");
-    return;
-  }
-
-  File file = SPIFFS.open("/data.csv", FILE_APPEND);
-  if (!file) {
-    Serial.println("Failed to open file for appending");
-  } else {
-    if (file.size() == 0) {
-      file.println("Timestamp,PeopleCount,MotionFrequency");
-      Serial.println("CSV file initialized with headers.");
+    // ======== WAKE-UP HANDLING ========
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        Serial.println("Woke up due to motion detected!");
+        lastMotionTime = millis(); // Reset motion time after wake-up
+    } else {
+        Serial.println("Power on or other wake-up cause");
     }
-    file.close();
-  }
 
-  pinMode(SENSOR_PIN, INPUT);
+    // ======== FILE SYSTEM (SPIFFS) INITIALIZATION ========
+    if (!SPIFFS.begin(true)) {
+        Serial.println("An error occurred while mounting SPIFFS");
+        return; // Exit setup if SPIFFS fails
+    }
 
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWi-Fi connected!");
-  Serial.print("ESP32 IP Address: ");
-  Serial.println(WiFi.localIP());
+    // Initialize the CSV file if it doesn't exist
+    File file = SPIFFS.open("/data.csv", FILE_APPEND);
+    if (!file) {
+        Serial.println("Failed to open file for appending");
+    } else {
+        if (file.size() == 0) { // Check if the file is empty
+            file.println("Timestamp,PeopleCount,MotionFrequency"); // Add headers
+            Serial.println("CSV file initialized with headers.");
+        }
+        file.close(); // Close the file
+    }
 
-  // Configure NTP
-  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+    // ======== SENSOR PIN SETUP ========
+    pinMode(SENSOR_PIN, INPUT); // Set sensor pin as input
 
-  // Set up MQTT
-  mqttClient.setServer(mqttServer, mqttPort);
-  Serial.print("Connecting to MQTT broker...");
-  if (mqttClient.connect("ESP32Client")) { // Use a unique client ID
-    Serial.println("Connected to MQTT broker!");
-  } else {
-    Serial.print("Failed to connect. MQTT state: ");
-    Serial.println(mqttClient.state()); // Print the MQTT state
-  }
+    // ======== WIFI CONNECTION ========
+    WiFi.begin(ssid, password); // Connect to Wi-Fi
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print("."); // Indicate connection attempt
+    }
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("ESP32 IP Address: ");
+    Serial.println(WiFi.localIP()); // Print the device's IP address
 
-  // Set up the web server
-  server.on("/", handleRoot); // Serve the webpage
-  server.on("/data", handleData); // Serve motion data as JSON
-  server.on("/download", handleDownloadCSV); // Serve the CSV file
-  server.on("/sse", handleSSE); // Serve live updates
-  server.begin();
-  Serial.println("Web server started!");
+    // ======== NTP CONFIGURATION ========
+    configTime(3600, 3600, "pool.ntp.org", "time.nist.gov"); // Set up NTP for time synchronization
 
-  // Set the start time for wake-up grace period
-  startTime = millis();
+    // ======== MQTT SETUP ========
+    mqttClient.setServer(mqttServer, mqttPort); // Configure MQTT broker
+    Serial.print("Connecting to MQTT broker...");
+    if (mqttClient.connect("ESP32Client")) { // Use a unique client ID
+        Serial.println("Connected to MQTT broker!");
+    } else {
+        Serial.print("Failed to connect. MQTT state: ");
+        Serial.println(mqttClient.state()); // Print the MQTT connection state
+    }
+
+    // ======== WEB SERVER SETUP ========
+    server.on("/", handleRoot); // Serve the main webpage
+    server.on("/data", handleData); // Serve motion data as JSON
+    server.on("/download", handleDownloadCSV); // Serve the CSV file for download
+    server.on("/sse", handleSSE); // Serve live updates via Server-Sent Events
+    server.begin(); // Start the web server
+    Serial.println("Web server started!");
+
+    // ======== START TIME INITIALIZATION ========
+    startTime = millis(); // Record the start time for motion tracking
 }
+// ======== END OF SETUP FUNCTION ========
 
-
-
+// ======== MAIN LOOP ========
 void loop() {
-    mqttClient.loop(); // Ensure MQTT library handles connection
-    server.handleClient(); // Handle HTTP requests
-    ensureMQTTConnection();
+    // ======== MQTT AND HTTP HANDLING ========
+    mqttClient.loop(); // Ensure MQTT library handles MQTT connections
+    server.handleClient(); // Handle incoming HTTP requests
+    ensureMQTTConnection(); // Reconnect to MQTT broker if disconnected
 
-    int rawState = digitalRead(SENSOR_PIN);
-
-    // Debounce logic
-    if (rawState != currentDebouncedState) {
-        if (millis() - lastDebounceTime > debounceDelay) {
-            currentDebouncedState = rawState;
-            lastDebounceTime = millis();
+    // ======== SENSOR INPUT DEBOUNCE ========
+    int rawState = digitalRead(SENSOR_PIN); // Read the sensor state
+    if (rawState != currentDebouncedState) { // Check if the state has changed
+        if (millis() - lastDebounceTime > debounceDelay) { // Debounce check
+            currentDebouncedState = rawState; // Update the debounced state
+            lastDebounceTime = millis(); // Update the last debounce time
 
             if (currentDebouncedState == LOW) { // Motion detected
-                motionActive = true;
-                lastMotionTime = millis();
-                motionCount++;
-                peopleCount++;
+                motionActive = true; // Mark motion as active
+                lastMotionTime = millis(); // Record the last motion time
+                motionCount++; // Increment motion counter
+                peopleCount++; // Increment people counter
 
-                // Log individual motion event
-                float frequency = (float)motionCount / ((millis() - startTime) / 60000.0);
-                logDataToCSV(peopleCount, frequency); // Log motion immediately
+                // ======== LOG AND PUBLISH INDIVIDUAL MOTION ========
+                float frequency = (float)motionCount / ((millis() - startTime) / 60000.0); // Calculate motion frequency
+                logDataToCSV(peopleCount, frequency); // Log the motion event
+                publishToMQTT(peopleCount, frequency); // Publish motion data to MQTT
 
-                // Use the publishToMQTT function to publish data
-                publishToMQTT(peopleCount, frequency);
-
-                Serial.println("Motion detected and logged.");
+                Serial.println("Motion detected and logged."); // Debug message
                 Serial.print("Current total: ");
                 Serial.println(peopleCount);
             }
 
-            if (currentDebouncedState == HIGH && motionActive) {
-                motionActive = false;
+            if (currentDebouncedState == HIGH && motionActive) { // Motion stopped
+                motionActive = false; // Reset motion state
             }
         }
     }
 
-    unsigned long currentTime = millis();
+    // ======== PERIODIC LOGGING ========
+    unsigned long currentTime = millis(); // Get the current time
+    if (currentTime - lastLogTime >= logInterval) { // Check if it's time to log
+        float frequency = (float)motionCount / ((currentTime - startTime) / 60000.0); // Calculate motion frequency
+        logDataToCSV(peopleCount, frequency); // Log periodic summary
+        publishToMQTT(peopleCount, frequency); // Publish periodic summary to MQTT
 
-    // Periodic log every 10 seconds
-    if (currentTime - lastLogTime >= logInterval) {
-        float frequency = (float)motionCount / ((currentTime - startTime) / 60000.0);
-        logDataToCSV(peopleCount, frequency); // Periodic log for summary
-
-        // Use the publishToMQTT function for periodic log
-        publishToMQTT(peopleCount, frequency);
-
-        totalMotions += motionCount;
-        intervals++;
-        motionCount = 0; // Reset after logging
-        lastLogTime = currentTime; // Update log timer
+        totalMotions += motionCount; // Update total motion count
+        intervals++; // Increment log intervals
+        motionCount = 0; // Reset motion count after logging
+        lastLogTime = currentTime; // Update last log time
     }
 
-    // Go to sleep after 1 minute of no motion
-    if (currentTime - lastMotionTime >= sleepInterval) {
-        Serial.println("No motion for 1 minute. Going to sleep...");
+    // ======== DEEP SLEEP TRIGGER ========
+    if (currentTime - lastMotionTime >= sleepInterval) { // Check if no motion for sleep interval
+        Serial.println("No motion for 1 minute. Going to sleep..."); // Debug message
         Serial.print("Total people counted: ");
         Serial.println(peopleCount);
 
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, LOW); // Enable GPIO wake-up
-        delay(100);
-        esp_deep_sleep_start();
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, LOW); // Configure GPIO wake-up
+        delay(100); // Short delay before sleep
+        esp_deep_sleep_start(); // Enter deep sleep mode
     }
 
-    delay(50);
+    delay(50); // Short delay for loop timing
 }
+// ======== END OF MAIN LOOP ========
+
 
 
 
